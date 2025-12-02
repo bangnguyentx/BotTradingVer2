@@ -282,7 +282,7 @@ function checkDailyGreeting() {
     const now = getVietnamTime();
     if (now.hours() === 4 && now.minutes() === 0) {
         signalCountToday = 0;
-        const greetingMsg = "🌞 Chào ngày mới các nhà giao dịch! AI Trading Bot V3 đã sẵn sàng săn tìm cơ hội. Chúc mọi người Big Win! 🚀";
+        const greetingMsg = "🌞 Chào ngày mới các nhà giao dịch! AI Trading đã sẵn sàng săn tìm cơ hội. Chúc mọi người Big Win! 🚀";
         broadcastToAllUsers(greetingMsg);
         console.log('🌞 Đã gửi lời chào buổi sáng');
     }
@@ -290,7 +290,7 @@ function checkDailyGreeting() {
 
 // Thiết lập Interval: 
 // 1. Quét tín hiệu 2 giờ/lần (giữ theo code gốc)
-const ANALYSIS_INTERVAL = 2 * 60 * 60 * 1000;
+const ANALYSIS_INTERVAL = 1 * 60 * 60 * 1000;
 setInterval(runAutoAnalysis, ANALYSIS_INTERVAL);
 
 // 2. Kiểm tra giờ chào mỗi phút
@@ -405,5 +405,5 @@ bot.onText(/\/analyzesymbol (.+)/, async (msg, match) => {
 });
 
 console.log('🤖 Bot is running with improved polling...');
-console.log(`⏰ Auto analysis every 2 hours (04:00 - 23:30)`);
+console.log(`⏰ Auto analysis every 1 hours (04:00 - 23:30)`);
 console.log(`🎯 Min confidence: 60% | Target coins: ${TARGET_COINS.length}`);
