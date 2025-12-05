@@ -2,13 +2,18 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const moment = require('moment-timezone');
 const express = require('express');
-const { analyzeSymbol, analyzePhysicsSymbol } = require('./analysis');
+const fs = require('fs').promises;
+const path = require('path');
+const { analyzeSymbol } = require('./analysis');
 
-// --- CẤU HÌNH ---
-const token = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN_HERE';
+// ---------- CẤU HÌNH ----------
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN_HERE';
+const PORT = process.env.PORT || 3000;
+const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
+const LAST_SIGNALS_FILE = process.env.LAST_SIGNALS_FILE || path.join(__dirname, 'last_signals.json');
 
-// --- CẤU HÌNH BOT CHỐNG LỖI POLLING ---
-const bot = new TelegramBot(token, {
+// --- BOT POLLING (SAFE) ---
+const bot = new TelegramBot(TOKEN, {
     polling: {
         interval: 300,
         autoStart: true,
@@ -18,392 +23,389 @@ const bot = new TelegramBot(token, {
     }
 });
 
-// Bắt lỗi polling để không bị crash app
+// Bắt lỗi polling để không crash
 bot.on("polling_error", (err) => {
-    if (err && err.code !== 'EFATAL') {
-        console.log(`[Polling Error] ${err.code || ''}: ${err.message || err}`);
-    }
+    console.error(`[Polling Error] ${err.code || ''}: ${err.message}`);
 });
 
+// ---------- SERVER EXPRESS (KEEP-ALIVE) ----------
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
+app.get('/', async (req, res) => {
+    const users = await loadUsers();
+    const lastSignals = await loadLastSignals();
+    res.json({
+        status: 'AI Trading Bot V3 is Running...',
+        subscribers: Object.keys(users).length,
+        lastSignalsSaved: Object.keys(lastSignals).length
+    });
+});
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', uptime: process.uptime() });
+});
+app.listen(PORT, () => console.log(`🚀 Server is running on port ${PORT}`));
 
-// TARGET_COINS TỐI ƯU - 60 COIN VOLATILITY CAO (giữ nguyên danh sách)
+// ---------- TARGET COINS (50 coins) ----------
 const TARGET_COINS = [
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'TRXUSDT', 'LINKUSDT',
-    'MATICUSDT', 'LTCUSDT', 'ATOMUSDT', 'ETCUSDT', 'XLMUSDT',
-    'BCHUSDT', 'FILUSDT', 'ALGOUSDT', 'NEARUSDT', 'UNIUSDT',
-    'DOGEUSDT', 'ZECUSDT', '1000PEPEUSDT', 'ZENUSDT', 'HYPEUSDT',
-    'WIFUSDT', 'MEMEUSDT', 'BOMEUSDT', 'POPCATUSDT', 'MYROUSDT',
-    'DOGUSDT', 'TOSHIUSDT', 'MOGUSDT', 'TURBOUSDT', 'NFPUSDT',
-    'PEOPLEUSDT', 'ARCUSDT', 'BTCDOMUSDT', 'TRUMPUSDT', 'DASHUSDT',
-    'APTUSDT', 'ARBUSDT', 'OPUSDT', 'SUIUSDT', 'SEIUSDT',
-    'TIAUSDT', 'INJUSDT', 'RNDRUSDT', 'FETUSDT', 'AGIXUSDT',
-    'OCEANUSDT', 'JASMYUSDT', 'GALAUSDT', 'SANDUSDT', 'MANAUSDT',
-    'ENJUSDT', 'CHZUSDT', 'APEUSDT', 'GMTUSDT', 'LDOUSDT'
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','AVAXUSDT','DOTUSDT','LINKUSDT','MATICUSDT',
+  'LTCUSDT','BCHUSDT','ATOMUSDT','ETCUSDT','XLMUSDT','FILUSDT','ALGOUSDT','NEARUSDT','UNIUSDT','DOGEUSDT',
+  'ZECUSDT','PEPEUSDT','ZENUSDT','HYPEUSDT','WIFUSDT','MEMEUSDT','BOMEUSDT','POPCATUSDT','MYROUSDT','DOGUSDT',
+  'TOSHIUSDT','MOGUSDT','TURBOUSDT','PEOPLEUSDT','ARCUSDT','DASHUSDT','APTUSDT','ARBUSDT','OPUSDT','SUIUSDT',
+  'SEIUSDT','TIAUSDT','INJUSDT','RNDRUSDT','FETUSDT','AGIXUSDT','OCEANUSDT','JASMYUSDT','GALAUSDT','SANDUSDT'
 ];
 
-// --- SUBSCRIBED USERS STORAGE IN-MEM (simple) ---
-const subscribedUsers = new Map(); // chatId -> { userInfo, activatedAt }
-
-// --- BIẾN TRẠNG THÁI ---
+// ---------- STATE & SETTINGS ----------
 let signalCountToday = 0;
 let isAutoAnalysisRunning = false;
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5;
 
-// --- SERVER EXPRESS (KEEP-ALIVE) ---
-app.get('/', (req, res) => {
-    res.json({
-        status: 'AI Trading Bot V3 is Running...',
-        subscribedUsers: subscribedUsers.size,
-        lastSignalCount: signalCountToday
-    });
-});
+// interval: 1.5 hours
+const ANALYSIS_INTERVAL = 1.5 * 60 * 60 * 1000; // in ms
+const START_DELAY_MS = 10 * 1000; // run after 10s
 
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        uptime: process.uptime(),
-        users: subscribedUsers.size,
-        signals: signalCountToday
-    });
-});
+// duplicate suppression: do not resend same symbol within 1 hour
+const DUPLICATE_WINDOW_SECONDS = 60 * 60; // 3600s = 1 hour
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server is running on port ${PORT}`);
-});
+// ---------- Utilities: persistent storage for users & last signals ----------
+async function ensureFile(filePath, defaultData) {
+    try {
+        await fs.access(filePath);
+    } catch {
+        await fs.writeFile(filePath, JSON.stringify(defaultData, null, 2), 'utf8');
+    }
+}
 
-// --- TIỆN ÍCH ---
+async function loadUsers() {
+    await ensureFile(USERS_FILE, {});
+    try {
+        const raw = await fs.readFile(USERS_FILE, 'utf8');
+        return JSON.parse(raw || '{}');
+    } catch (e) {
+        console.error('Failed load users:', e.message);
+        return {};
+    }
+}
+
+async function saveUsers(obj) {
+    try {
+        await fs.writeFile(USERS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Failed save users:', e.message);
+    }
+}
+
+async function loadLastSignals() {
+    await ensureFile(LAST_SIGNALS_FILE, {});
+    try {
+        const raw = await fs.readFile(LAST_SIGNALS_FILE, 'utf8');
+        return JSON.parse(raw || '{}');
+    } catch (e) {
+        console.error('Failed load last_signals:', e.message);
+        return {};
+    }
+}
+
+async function saveLastSignals(obj) {
+    try {
+        await fs.writeFile(LAST_SIGNALS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Failed save last_signals:', e.message);
+    }
+}
+
+// ---------- Helper: vietnam time ----------
 function getVietnamTime() {
     return moment().tz("Asia/Ho_Chi_Minh");
 }
 
-function formatSignalMessage(data, signalIndex, source = 'AI_RSI') {
-    // source: 'AI_RSI' or 'PHYSICS'
-    const botLabel = source === 'PHYSICS' ? 'Physics Momentum' : 'AI TRADING V3/AI RSI';
-    const icon = (data.direction === 'LONG' || data.side === 'LONG') ? '🟢' : '🔴';
-
-    const fmt = (num) => {
-        if (num === undefined || num === null) return 'N/A';
-        const number = parseFloat(num);
-        if (isNaN(number)) return 'N/A';
-        if (number >= 1) return number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-        return number.toFixed(8).replace(/(?:\.0+|(\.\d+?)0+)$/,'$1');
-    };
-
-    const symbol = (data.symbol || data.symbolName || '').replace('USDT', '');
-    const direction = (data.direction || data.side || '').toUpperCase();
-    const entry = fmt(data.entry);
-    const tp = fmt(data.tp);
-    const sl = fmt(data.sl);
-    const rr = data.rr !== undefined && data.rr !== null ? `${data.rr}` : '-';
-    const conf = data.confidence !== undefined ? `${data.confidence}%` : (data.conf ? `${data.conf}%` : '-');
-
-    const header = `🤖 Tín hiệu [${signalIndex} trong ngày]\n#${symbol} – [${direction}] 📌\n\n`;
-    const body = `${icon} Entry: ${entry}\n🆗 Take Profit: ${tp}\n🙅‍♂️ Stop-Loss: ${sl}\n🪙 Tỉ lệ RR: ${rr} (Conf: ${conf})\n\n🧠 By Bot [${botLabel}]\n\n⚠️ Nhất định phải tuân thủ quản lý rủi ro – Đi tối đa 2-3% risk, Bot chỉ để tham khảo, win 3 lệnh nên ngưng`;
-
-    return header + body;
+// ---------- Message formatting ----------
+function fmtNum(num) {
+    if (num === undefined || num === null || isNaN(Number(num))) return 'N/A';
+    const v = Number(num);
+    if (v >= 1) return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+    return v.toFixed(8).replace(/\.?0+$/, '');
 }
 
+function formatSignalMessage(data, signalIndex) {
+    const icon = data.direction === 'LONG' ? '🟢' : '🔴';
+    const conf = data.confidence !== undefined ? `${data.confidence}%` : (data.meta && data.meta.confidence ? `${data.meta.confidence}%` : 'N/A');
+
+    const msg = `🤖 Tín hiệu [${signalIndex} trong ngày]
+#${data.symbol.replace('USDT','')} – [${data.direction}] 📌
+
+${icon} Entry: ${fmtNum(data.entry)}
+🆗 Take Profit: ${fmtNum(data.tp)}
+🙅‍♂️ Stop-Loss: ${fmtNum(data.sl)}
+🪙 Tỉ lệ RR: ${data.rr || '-'} (Conf: ${conf})
+
+🧠 By Bot [AI TRADING V3/AI RSI]
+
+⚠️ Nhất định phải tuân thủ quản lý rủi ro – Đi tối đa 2-3% risk, Bot chỉ để tham khảo, win 3 lệnh nên ngưng`;
+
+    return msg;
+}
+
+// ---------- Broadcast with retries & prune blocked users ----------
 async function broadcastToAllUsers(message) {
-    let successCount = 0;
-    let failCount = 0;
-
-    for (const [chatId, userData] of subscribedUsers) {
-        let retryCount = 0;
-        const maxRetries = 3;
-        let sent = false;
-
-        while (retryCount < maxRetries && !sent) {
+    const users = await loadUsers();
+    let success = 0, fail = 0;
+    const userIds = Object.keys(users);
+    for (const id of userIds) {
+        let retries = 0, sent = false;
+        while (retries < 3 && !sent) {
             try {
-                await bot.sendMessage(chatId, message);
-                successCount++;
+                await bot.sendMessage(Number(id), message);
                 sent = true;
-                await new Promise(resolve => setTimeout(resolve, 100));
-            } catch (err) {
-                retryCount++;
-                console.log(`❌ Lỗi gửi cho ${userData.userInfo.username || userData.userInfo.first_name || chatId} (lần ${retryCount}):`, (err && err.message) || err);
-
-                if (retryCount >= maxRetries) {
-                    failCount++;
-                    // If forbidden, remove user
-                    if (err && err.response && err.response.statusCode === 403) {
-                        subscribedUsers.delete(chatId);
-                        console.log(`🗑️ Đã xóa user bị chặn: ${userData.userInfo.username || userData.userInfo.first_name}`);
-                    }
-                } else {
-                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+                success++;
+                // tiny delay between messages
+                await new Promise(r => setTimeout(r, 80));
+            } catch (e) {
+                retries++;
+                console.warn(`Failed to send to ${id} (attempt ${retries}): ${e.message}`);
+                // if forbidden (bot blocked), remove user
+                if (e.response && (e.response.statusCode === 403 || e.response.statusCode === 410)) {
+                    delete users[id];
+                    await saveUsers(users);
+                    console.log(`Removed blocked user ${id}`);
+                    sent = true; // stop retrying
+                    fail++;
+                    break;
                 }
+                if (retries < 3) await new Promise(r => setTimeout(r, 1000 * retries));
+                else fail++;
             }
         }
     }
-
-    console.log(`📤 Broadcast: ${successCount} thành công, ${failCount} thất bại`);
-    return { success: successCount, fail: failCount };
+    return { success, fail };
 }
 
-// --- AUTO REFRESH / SCANNER PHỐI HỢP 2 LOGIC ---
+// ---------- Duplicate suppression ----------
+async function shouldSendSignal(symbol) {
+    const lastSignals = await loadLastSignals();
+    const key = symbol.toUpperCase();
+    if (!lastSignals[key]) return true;
+    const lastTs = lastSignals[key]; // epoch seconds
+    const now = Math.floor(Date.now() / 1000);
+    if ((now - lastTs) < DUPLICATE_WINDOW_SECONDS) return false;
+    return true;
+}
+
+async function markSignalSent(symbol) {
+    const lastSignals = await loadLastSignals();
+    lastSignals[symbol.toUpperCase()] = Math.floor(Date.now() / 1000);
+    await saveLastSignals(lastSignals);
+}
+
+// ---------- Auto analysis main loop ----------
 async function runAutoAnalysis() {
     if (isAutoAnalysisRunning) {
-        console.log('⏳ Auto analysis đang chạy, bỏ qua...');
+        console.log('⏳ Auto analysis already running, skip this cycle.');
         return;
     }
-
-    // Circuit breaker
-    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        console.log('🚨 Circuit breaker activated - Too many consecutive errors. Skipping this analysis cycle.');
-        return;
-    }
-
-    const now = getVietnamTime();
-    const currentHour = now.hours();
-    const currentMinute = now.minutes();
-
-    // operating hours unchanged
-    if (currentHour < 4 || (currentHour === 23 && currentMinute > 30)) {
-        console.log('💤 Out of operating hours (04:00 - 23:30). Sleeping...');
-        return;
-    }
-
-    if (subscribedUsers.size === 0) {
-        console.log('👥 No subscribed users. Skipping auto analysis.');
-        return;
-    }
-
     isAutoAnalysisRunning = true;
-    console.log(`🔄 Starting Auto Analysis at ${now.format('HH:mm')} - ${subscribedUsers.size} users`);
-
-    let signalsFound = 0;
-    let analyzedCount = 0;
 
     try {
-        for (const coin of TARGET_COINS) {
-            analyzedCount++;
+        const now = getVietnamTime();
+        const hour = now.hours();
+        const minute = now.minutes();
 
-            // dynamic polite delay (keeps from hammering single source)
-            const dynamicDelay = 2000 + (Math.floor(analyzedCount / 10) * 500) + (Math.random() * 1000);
-            await new Promise(r => setTimeout(r, dynamicDelay));
-
-            try {
-                console.log(`🔍 Analyzing (AI RSI) ${coin} (${analyzedCount}/${TARGET_COINS.length})...`);
-                const result_rsi = await analyzeSymbol(coin); // logic cũ (ICT)
-                if (result_rsi && result_rsi.direction && result_rsi.direction !== 'NO_TRADE') {
-                    if ((result_rsi.confidence || 0) >= 60) {
-                        signalCountToday++;
-                        signalsFound++;
-                        const msg = formatSignalMessage(result_rsi, signalCountToday, 'AI_RSI');
-                        console.log(`✅ [AI_RSI] Signal found: ${coin} ${result_rsi.direction} (${result_rsi.confidence}%)`);
-                        await broadcastToAllUsers(msg);
-                        await new Promise(r => setTimeout(r, 1000));
-                    } else {
-                        console.log(`⏭️ [AI_RSI] Skip ${coin}: Confidence ${result_rsi.confidence}%`);
-                    }
-                } else {
-                    console.log(`➖ [AI_RSI] No signal for ${coin}: ${result_rsi?.direction || 'NO_TRADE'}`);
-                }
-            } catch (errAI) {
-                console.error(`❌ Error (AI_RSI) analyzing ${coin}:`, errAI.message || errAI);
-                // if rate-limit-like errors, track consecutiveErrors
-                if ((errAI.message || '').includes('418') || (errAI.message || '').includes('429')) {
-                    consecutiveErrors++;
-                    console.log(`🚨 Consecutive errors: ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}`);
-                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                        console.log('🔌 Circuit breaker triggered! Waiting 10 minutes...');
-                        setTimeout(() => {
-                            consecutiveErrors = 0;
-                            console.log('🔋 Circuit breaker reset');
-                        }, 10 * 60 * 1000);
-                        break;
-                    }
-                } else {
-                    consecutiveErrors = 0;
-                }
-            }
-
-            // Giữa hai logic, thêm delay nhỏ
-            await new Promise(r => setTimeout(r, 500));
-
-            // Physics Momentum logic
-            try {
-                console.log(`🔍 Analyzing (Physics) ${coin} (${analyzedCount}/${TARGET_COINS.length})...`);
-                const result_phy = await analyzePhysicsSymbol(coin); // physics logic
-                if (result_phy && result_phy.side) {
-                    // map to direction field for homogeneous formatting
-                    result_phy.direction = result_phy.side;
-                    // confidence threshold — set 60 minimum
-                    if ((result_phy.confidence || 0) >= 60) {
-                        signalCountToday++;
-                        signalsFound++;
-                        const msg = formatSignalMessage(result_phy, signalCountToday, 'PHYSICS');
-                        console.log(`✅ [PHYSICS] Signal found: ${coin} ${result_phy.side} (${result_phy.confidence}%)`);
-                        await broadcastToAllUsers(msg);
-                        await new Promise(r => setTimeout(r, 1000));
-                    } else {
-                        console.log(`⏭️ [PHYSICS] Skip ${coin}: Confidence ${result_phy.confidence}%`);
-                    }
-                } else {
-                    console.log(`➖ [PHYSICS] No signal for ${coin}`);
-                }
-            } catch (errPhy) {
-                console.error(`❌ Error (Physics) analyzing ${coin}:`, errPhy.message || errPhy);
-                // treat rate-limit similarly
-                if ((errPhy.message || '').includes('418') || (errPhy.message || '').includes('429')) {
-                    consecutiveErrors++;
-                    console.log(`🚨 Consecutive errors: ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}`);
-                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                        console.log('🔌 Circuit breaker triggered! Waiting 10 minutes...');
-                        setTimeout(() => {
-                            consecutiveErrors = 0;
-                            console.log('🔋 Circuit breaker reset');
-                        }, 10 * 60 * 1000);
-                        break;
-                    }
-                } else {
-                    consecutiveErrors = 0;
-                }
-            }
-
-            // small polite delay between coins
-            await new Promise(r => setTimeout(r, 800));
+        // Operating hours: keep same 04:00 - 23:30 as before (you can remove if want 24/7)
+        if (hour < 4 || (hour === 23 && minute > 30)) {
+            console.log('💤 Out of operating hours (04:00 - 23:30), skip.');
+            isAutoAnalysisRunning = false;
+            return;
         }
 
-        console.log(`🎯 Auto analysis completed. Found ${signalsFound} signals out of ${TARGET_COINS.length} coins`);
-    } catch (error) {
-        console.error('💥 Critical error in auto analysis:', error);
+        const users = await loadUsers();
+        if (Object.keys(users).length === 0) {
+            console.log('👥 No subscribers, skipping analysis.');
+            isAutoAnalysisRunning = false;
+            return;
+        }
+
+        console.log(`🔄 Starting Auto Analysis at ${now.format('HH:mm')} for ${Object.keys(users).length} users`);
+        let signalsFound = 0;
+
+        for (let i = 0; i < TARGET_COINS.length; i++) {
+            const coin = TARGET_COINS[i];
+            try {
+                console.log(`🔍 Analyzing ${coin} (${i+1}/${TARGET_COINS.length})`);
+                const result = await analyzeSymbol(coin); // returns object with direction/confidence/entry.. etc
+
+                if (result && result.direction && result.direction !== 'NO_TRADE' && result.direction !== 'NEUTRAL') {
+                    // require confidence ≥ 60 (same logic)
+                    const conf = result.confidence || (result.meta && result.meta.confidence) || 0;
+                    if (conf >= 60) {
+                        // duplicate suppression per symbol within 1 hour
+                        const okToSend = await shouldSendSignal(result.symbol);
+                        if (!okToSend) {
+                            console.log(`⏭️ Skip ${result.symbol}: recently signaled within ${DUPLICATE_WINDOW_SECONDS/60} minutes`);
+                        } else {
+                            signalCountToday++;
+                            signalsFound++;
+                            const msg = formatSignalMessage(result, signalCountToday);
+                            await broadcastToAllUsers(msg);
+                            await markSignalSent(result.symbol);
+                            console.log(`✅ Sent signal for ${result.symbol} (${result.direction}) conf=${conf}%`);
+                            // small delay after sending
+                            await new Promise(r => setTimeout(r, 2000));
+                        }
+                    } else {
+                        console.log(`⏭️ ${coin}: confidence ${conf}% < 60%`);
+                    }
+                } else {
+                    console.log(`➖ No signal for ${coin}: ${result?.direction || 'NO_TRADE'}`);
+                }
+            } catch (coinErr) {
+                console.error(`❌ Error analyzing ${coin}: ${coinErr.message}`);
+                // handle rate-limit-like issues: bump consecutiveErrors
+                if (String(coinErr.message).includes('429') || String(coinErr.message).includes('418')) {
+                    consecutiveErrors++;
+                    console.log(`🚨 Consecutive errors: ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}`);
+                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                        console.log('🔌 Circuit breaker triggered — sleeping 10 minutes before next cycles');
+                        // reset after 10 minutes
+                        setTimeout(() => { consecutiveErrors = 0; console.log('🔋 Circuit breaker reset'); }, 10 * 60 * 1000);
+                        break;
+                    }
+                } else {
+                    consecutiveErrors = 0;
+                }
+            }
+
+            // politeness delay between coins (3s)
+            await new Promise(r => setTimeout(r, 3000));
+        }
+
+        console.log(`🎯 Auto analysis finished — signalsFound=${signalsFound}`);
+    } catch (err) {
+        console.error('💥 Critical error in runAutoAnalysis:', err.message);
     } finally {
         isAutoAnalysisRunning = false;
     }
 }
 
-// Gửi lời chào mỗi ngày mới (Reset count)
-function checkDailyGreeting() {
-    const now = getVietnamTime();
-    if (now.hours() === 4 && now.minutes() === 0) {
-        signalCountToday = 0;
-        const greetingMsg = "🌞 Chào ngày mới các nhà giao dịch! AI Trading đã sẵn sàng săn tìm cơ hội. Chúc mọi người Big Win! 🚀";
-        broadcastToAllUsers(greetingMsg);
-        console.log('🌞 Đã gửi lời chào buổi sáng');
-    }
-}
-
-// Thiết lập Interval: 
-// 1. Quét tín hiệu 2 giờ/lần (giữ theo code gốc)
-const ANALYSIS_INTERVAL = 1 * 60 * 60 * 1000;
+// ---------- Scheduling ----------
 setInterval(runAutoAnalysis, ANALYSIS_INTERVAL);
+setTimeout(() => { runAutoAnalysis(); }, START_DELAY_MS);
 
-// 2. Kiểm tra giờ chào mỗi phút
-setInterval(checkDailyGreeting, 60 * 1000);
+// ---------- Bot commands ----------
 
-// Chạy phân tích ngay khi khởi động (sau 10s)
-setTimeout(() => {
-    runAutoAnalysis();
-}, 10000);
+// /start - đăng ký nhận tin
+bot.onText(/\/start/, async (msg) => {
+    try {
+        const chatId = msg.chat.id;
+        const user = msg.from;
+        const users = await loadUsers();
+        users[chatId] = {
+            id: user.id,
+            username: user.username || null,
+            first_name: user.first_name || null,
+            addedAt: new Date().toISOString()
+        };
+        await saveUsers(users);
 
-// --- BOT COMMANDS ---
-// /start - đăng ký nhận tín hiệu
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    const user = msg.from;
+        const welcome = `👋 Chào ${user.first_name || 'Trader'}!\n\n` +
+            `Bạn đã được đăng ký nhận tín hiệu tự động từ AI Trading Bot V3.\n` +
+            `Chỉ cần giữ bot và chờ tín hiệu. Nếu muốn phân tích thủ công, dùng /analyzesymbol SYMBOL\n\n` +
+            `⚠️ Bot chỉ gửi tín hiệu tham khảo — luôn tuân thủ quản lý rủi ro.`;
 
-    const userInfo = {
-        id: user.id,
-        username: user.username,
-        first_name: user.first_name,
-        last_name: user.last_name
-    };
-
-    const userData = {
-        userInfo: userInfo,
-        activatedAt: new Date()
-    };
-
-    subscribedUsers.set(chatId, userData);
-
-    const welcomeMsg = `👋 Chào ${user.first_name || 'Trader'}!\n\n🧠 Bạn đã được đăng ký nhận tín hiệu tự động từ AI Trading Bot V3.\n\n🔔 Chỉ cần chờ bot gửi tín hiệu — tuân thủ quản lý rủi ro.`;
-    bot.sendMessage(chatId, welcomeMsg);
-    console.log(`✅ User subscribed: ${user.username || user.first_name} (ID: ${user.id})`);
+        await bot.sendMessage(chatId, welcome);
+        console.log(`✅ Subscribed user ${chatId} (${user.username || user.first_name})`);
+    } catch (e) {
+        console.error('/start handler error:', e.message);
+    }
 });
 
-// /signal manual (bất kỳ user nào có thể gửi)
-bot.onText(/\/signal (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const text = match[1].trim();
-    // format expected: SYMBOL LONG/SHORT ENTRY SL TP
-    const parts = text.split(/\s+/);
-    if (parts.length < 5) {
-        return bot.sendMessage(chatId, '❌ Sai format. /signal SYMBOL LONG/SHORT ENTRY SL TP');
+// /stop - hủy đăng ký
+bot.onText(/\/stop/, async (msg) => {
+    try {
+        const chatId = msg.chat.id;
+        const users = await loadUsers();
+        if (users[chatId]) {
+            delete users[chatId];
+            await saveUsers(users);
+            await bot.sendMessage(chatId, '🗑️ Bạn đã hủy đăng ký nhận tín hiệu. Gõ /start để đăng ký lại.');
+            console.log(`User unsubscribed ${chatId}`);
+        } else {
+            await bot.sendMessage(chatId, 'Bạn chưa đăng ký nhận tín hiệu. Gõ /start để đăng ký.');
+        }
+    } catch (e) {
+        console.error('/stop handler error:', e.message);
     }
-    const symbol = parts[0].toUpperCase();
-    const direction = parts[1].toUpperCase();
-    const entry = parseFloat(parts[2]);
-    const sl = parseFloat(parts[3]);
-    const tp = parseFloat(parts[4]);
-    if (!['LONG','SHORT'].includes(direction) || isNaN(entry) || isNaN(sl) || isNaN(tp)) {
-        return bot.sendMessage(chatId, '❌ Sai giá trị. Hãy kiểm tra lại.');
-    }
-    signalCountToday++;
-    const rr = (Math.abs(tp - entry) / Math.abs(entry - sl)).toFixed(2);
-    const result = {
-        symbol,
-        direction,
-        entry,
-        sl,
-        tp,
-        rr,
-        confidence: 100
-    };
-    const msgText = formatSignalMessage({
-        symbol,
-        direction,
-        entry,
-        sl,
-        tp,
-        rr,
-        confidence: 100
-    }, signalCountToday, 'AI_RSI');
-    const res = await broadcastToAllUsers(msgText);
-    bot.sendMessage(chatId, `✅ Đã gửi tín hiệu đến ${res.success} thành viên, thất bại ${res.fail}`);
 });
 
-// /analyzesymbol [COIN] - phân tích 1 coin ngay lập tức (bất kỳ user)
-// Kết quả trả về cả 2 logic nếu có
+// /analyzesymbol SYMBOL - phân tích thủ công 1 coin
 bot.onText(/\/analyzesymbol (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const raw = match[1].trim().toUpperCase();
-    let symbol = raw;
-    if (!symbol.endsWith('USDT')) symbol += 'USDT';
-
-    const processingMsg = await bot.sendMessage(chatId, `⏳ Đang phân tích ${symbol}...`);
-
+    const symbolRaw = match[1].toUpperCase().trim();
+    let symbol = symbolRaw.endsWith('USDT') ? symbolRaw : `${symbolRaw}USDT`;
     try {
-        // AI RSI logic
-        const res_rsi = await analyzeSymbol(symbol).catch(e => { console.error(e); return null; });
-        if (res_rsi && res_rsi.direction && res_rsi.direction !== 'NO_TRADE') {
-            const txt = formatSignalMessage(res_rsi, 'MANUAL', 'AI_RSI');
-            await bot.sendMessage(chatId, `🔎 Kết quả AI_RSI:\n\n${txt}`);
+        const processing = await bot.sendMessage(chatId, `⏳ Đang phân tích ${symbol}...`);
+        const result = await analyzeSymbol(symbol);
+        if (result && result.direction && result.direction !== 'NO_TRADE' && result.direction !== 'NEUTRAL') {
+            const content = formatSignalMessage(result, 'MANUAL');
+            await bot.deleteMessage(chatId, processing.message_id).catch(()=>{});
+            await bot.sendMessage(chatId, content);
         } else {
-            await bot.sendMessage(chatId, `🔎 Kết quả AI_RSI: Không tìm thấy tín hiệu cho ${symbol}`);
+            await bot.editMessageText(`❌ Không tìm thấy tín hiệu cho ${symbol}\nReason: ${result?.reason || 'No trade'}`, { chat_id: chatId, message_id: processing.message_id });
         }
-
-        // Physics logic
-        const res_phy = await analyzePhysicsSymbol(symbol).catch(e => { console.error(e); return null; });
-        if (res_phy && res_phy.side) {
-            res_phy.direction = res_phy.side;
-            const txt2 = formatSignalMessage(res_phy, 'MANUAL', 'PHYSICS');
-            await bot.sendMessage(chatId, `🔎 Kết quả Physics Momentum:\n\n${txt2}`);
-        } else {
-            await bot.sendMessage(chatId, `🔎 Kết quả Physics Momentum: Không tìm thấy tín hiệu cho ${symbol}`);
-        }
-    } catch (err) {
-        console.error('Error analyze single symbol:', err);
-        await bot.sendMessage(chatId, `❌ Lỗi khi phân tích ${symbol}: ${(err && err.message) || err}`);
-    } finally {
-        try { bot.deleteMessage(chatId, processingMsg.message_id); } catch (e) {}
+    } catch (e) {
+        console.error('/analyzesymbol error:', e.message);
+        try { await bot.sendMessage(chatId, `❌ Lỗi phân tích ${symbol}: ${e.message}`); } catch {}
     }
 });
 
-console.log('🤖 Bot is running with improved polling...');
-console.log(`⏰ Auto analysis every 1 hours (04:00 - 23:30)`);
-console.log(`🎯 Min confidence: 60% | Target coins: ${TARGET_COINS.length}`);
+// /analyzeall - phân tích toàn bộ TARGET_COINS (accessible to any user)
+bot.onText(/\/analyzeall/, async (msg) => {
+    const chatId = msg.chat.id;
+    try {
+        const processing = await bot.sendMessage(chatId, `⏳ Đang phân tích ${TARGET_COINS.length} coins... Vui lòng chờ (có thể lâu vài phút).`);
+        let results = [];
+        for (let i = 0; i < TARGET_COINS.length; i++) {
+            const coin = TARGET_COINS[i];
+            try {
+                const res = await analyzeSymbol(coin);
+                if (res && res.direction && res.direction !== 'NO_TRADE' && res.confidence >= 60) {
+                    results.push(res);
+                }
+            } catch (e) {
+                console.warn(`Analyze ${coin} failed: ${e.message}`);
+            }
+            await new Promise(r => setTimeout(r, 1200));
+        }
+        await bot.deleteMessage(chatId, processing.message_id).catch(()=>{});
+        if (results.length === 0) {
+            await bot.sendMessage(chatId, '❌ Không tìm thấy tín hiệu (confidence ≥ 60%) trên toàn bộ danh sách.');
+        } else {
+            results = results.sort((a,b)=> (b.confidence||0)-(a.confidence||0)).slice(0, 20);
+            let text = `🔍 KẾT QUẢ PHÂN TÍCH TOÀN BỘ (${results.length} tín hiệu, hiển thị tối đa 20)\n\n`;
+            for (const r of results) {
+                text += `#${r.symbol.replace('USDT','')} - ${r.direction} - Conf: ${r.confidence}%\nEntry: ${fmtNum(r.entry)} | SL: ${fmtNum(r.sl)} | TP: ${fmtNum(r.tp)}\n\n`;
+            }
+            await bot.sendMessage(chatId, text);
+        }
+    } catch (e) {
+        console.error('/analyzeall error:', e.message);
+        try { await bot.sendMessage(chatId, `❌ Lỗi: ${e.message}`); } catch {}
+    }
+});
+
+// /users - list subscribers (for owner only if you want, currently open)
+bot.onText(/\/users/, async (msg) => {
+    try {
+        const users = await loadUsers();
+        const total = Object.keys(users).length;
+        let text = `📊 Subscribers: ${total}\n\n`;
+        for (const id of Object.keys(users).slice(0, 100)) {
+            const u = users[id];
+            text += `- ${id} ${u.username ? `(@${u.username})` : ''} added: ${u.addedAt}\n`;
+        }
+        await bot.sendMessage(msg.chat.id, text);
+    } catch (e) {
+        console.error('/users error:', e.message);
+    }
+});
+
+console.log('🤖 Bot running. Auto analysis every 1.5 hours (active window 04:00-23:30).');
